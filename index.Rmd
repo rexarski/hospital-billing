@@ -1,0 +1,356 @@
+---
+title: "Exploratory Data Analysis on Hospital Billing Data"
+date: "`r Sys.Date()`"
+author: "Rui Qiu"
+output:
+  rmdformats::robobook:
+    highlight: kate
+    lightbox: true
+---
+
+```{r, include=FALSE}
+## Global options
+knitr::opts_chunk$set(cache = TRUE)
+```
+
+```{r, echo=FALSE, message=FALSE}
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(
+  tidyverse, janitor, skimr, styler, ggtext, showtext,
+  ggthemes, readxl, lubridate, glue, patchwork, MetBrewer,
+  geofacet, tidytext, arrow
+)
+
+font_add_google(name = "Roboto Mono", family = "Roboto Mono")
+
+theme_set(
+  theme_minimal() +
+    theme(
+      legend.position = "bottom",
+      legend.background = element_rect(fill = "#F9EFE6", color = "#F9EFE6"),
+      legend.key = element_rect(fill = "#F9EFE6", color = "#F9EFE6"),
+      legend.title = element_text(size = 7, color = "#3B372E"),
+      legend.text = element_text(size = 7, color = "#3B372E"),
+      plot.background = element_rect(fill = "#F9EFE6", color = "#F9EFE6"),
+      panel.background = element_rect(fill = "#F9EFE6", color = "#F9EFE6"),
+      text = element_text(
+        family = "Roboto Mono",
+        color = "#3B372E"
+      ),
+      axis.title.y = element_text(vjust = 0.2, face = "bold"),
+      axis.title.x = element_text(hjust = 0.5, face = "bold"),
+      axis.text.x = element_text(),
+      axis.text.y = element_text(angle = 30),
+      plot.title = element_markdown(
+        size = 18, hjust = 0.5,
+        family = "Roboto Slab"
+      ),
+      plot.subtitle = element_markdown(
+        hjust = 0.5,
+        family = "Roboto Slab"
+      ),
+      plot.caption = element_markdown(
+        size = 10,
+        family = "Roboto Slab",
+        hjust = 0
+      ),
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      plot.margin = margin(15, 15, 15, 15)
+    )
+)
+```
+
+# Preliminary cleaning
+
+Manipulations:
+
+- Remove rows with MRN only (NA in other columns).
+- Mutate `pt_deceased` to a logical variable.
+- Unify “unknown” categories in `pt_race`.
+- Unify “unknown” categories in `pt_ethnicity`.
+
+```{r, echo=FALSE}
+data <- read_xlsx("data/Billing_Data_15_Mar_2022_deid2.xlsx",
+  col_types = c(
+    rep("guess", 33), rep("text", 4),
+    rep("date", 2)
+  )
+) |>
+  clean_names()
+
+# skim(data)
+
+# Starting from line 47636, the records contain nothing but MRN code, so we believe it's okay to get rid of that part for now
+
+# One of the identifier (not recommended but effective here) is to use dept_name (which is doubled-checked with `sum(!is.na(data$dept_name))`)
+
+# loc_cat_2_name is a good cateogry to use in fact
+
+data <- data |>
+  drop_na(dept_name) |>
+  mutate(
+    pt_deceased = if_else(
+      pt_deceased == "N", FALSE, TRUE
+    ),
+    pt_race = if_else(
+      pt_race %in% c(
+        "DECLINED TO ANSWER",
+        "DECLINED/UNKNOWN",
+        "Unknown",
+        "UNKNOWN"
+      ),
+      "DECLINED/UNKNOWN", pt_race
+    ),
+    pt_ethnicity = if_else(
+      pt_ethnicity %in% c("UNKNOWN", "DECLINED TO ANSWER") |
+        is.na(pt_ethnicity),
+      "DECLINED/UNKNOWN", pt_ethnicity
+    )
+  )
+```
+
+After cleaning, `skim()` would reveal the general structure of the remaining data set:
+
+```{r, echo=FALSE}
+skim(data)
+```
+
+So basically, we have:
+
+- 47634 valid records of hospital billings. Each record consists of 39 columns.
+- All character variables excluding diagnoses are complete, without missing values.
+  - Note that some categorical data are marked as "unknown".
+
+Starting from here, we will group data by unique patient as some patients have multiple billing records.
+
+# EDA
+
+One thing to notice here is that the medical record number (MRN) should be unique for each patient, but there seems to be a discrepancy in Date of Birth:
+
+```{r, echo=FALSE, message=FALSE}
+data |>
+  select(new_mrn, new_dob, pt_sex, pt_race, pt_deceased, pt_ethnicity) |>
+  filter(new_mrn == "51587384")
+```
+
+## Patients
+
+- Add a manual `ID` to distinguish each patient.
+
+> If we randomly assign a `DOB` to the records under the same `MRN`, we could've ended up with some ages < 0 by the time of the visit.
+
+- Calculate the age by the time of the service.
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+data <- data |>
+  mutate(
+    ID = group_indices(data, new_mrn, new_dob),
+    age = interval(new_dob, new_srvc_date) %/% years(1)
+  ) |>
+  relocate(ID)
+
+# write_csv(data, "data/cleaned-data.csv")
+# write_parquet(data, "data/cleaned-data.parquet")
+save(data, file = "cleaned-data.rda")
+```
+
+```{r, echo=FALSE, message=FALSE}
+grp_data <- data |>
+  group_by(ID) |>
+  summarize(
+    age = mean(age),
+    record_num = n(),
+    pt_sex = pt_sex,
+    pt_race = pt_race,
+    pt_ethnicity = pt_ethnicity,
+    pt_state = pt_state,
+    pt_deceased = pt_deceased
+  )
+
+# write_csv(grp_data, "data/grouped-data.csv")
+# write_parquet(grp_data, "data/grouped-data.parquet")
+save(grp_data, file = "grouped-data.rda")
+```
+
+### Age distribution
+
+```{r, echo=FALSE, message=FALSE}
+grp_data |>
+  drop_na(age) |>
+  ggplot(aes(
+    x = age,
+    color = pt_sex,
+    fill = pt_sex
+  )) +
+  geom_histogram(alpha = 0.5, bins = 50) +
+  facet_wrap(. ~ pt_sex) +
+  scale_colour_manual(
+    values = met.brewer("Hiroshige", 2, "discrete"),
+    aesthetics = c("fill", "color")
+  ) +
+  labs(
+    title = glue("THE AGE DISTRIBUTION OF
+                  PATIENTS"),
+    subtitle = glue("<span style='color:#72BCD5;'>**Male**</span> and <span style='color:#EF8A47;'>**Female**</span> patients' age are calculated by the time of their visits."),
+    caption = glue("**Source**: Hospital Billing Dataset<br>
+                   **Plot by**: Rui Qiu"),
+    x = "age",
+    y = "patient count"
+  ) +
+  theme(
+    legend.position = "none"
+  )
+
+ggsave(
+  filename = "figures/figure1.png",
+  plot = last_plot(),
+  height = 8, width = 8
+)
+```
+
+### Geolocation
+
+```{r, echo=FALSE, message=FALSE}
+grp_data |>
+  group_by(pt_state, pt_race) |>
+  summarize(count = n()) |>
+  ggplot(aes(x = pt_race, y = count, fill = pt_race)) +
+  geom_col() +
+  coord_flip() +
+  facet_geo(~pt_state) +
+  scale_colour_manual(
+    values = met.brewer("Hiroshige", 7, "discrete"),
+    aesthetics = c("fill", "color")
+  ) +
+  scale_y_continuous(breaks = c(0, 4000, 8000)) +
+  labs(
+    title = glue("THE RACE DISTRIBUTION BY STATES"),
+    caption = glue("**Source**: Hospital Billing Dataset<br>
+                   **Plot by**: Rui Qiu"),
+    x = "",
+    y = "patient count"
+  ) +
+  theme(
+    axis.title.y = element_text(vjust = 0.2, face = "bold"),
+    axis.title.x = element_text(hjust = 0.5, face = "bold"),
+    axis.text.x = element_text(size = 7),
+    axis.text.y = element_text(size = 5, angle = 0)
+  )
+
+ggsave(
+  filename = "figures/figure2.png",
+  plot = last_plot(),
+  height = 8, width = 12
+)
+```
+
+**Click [here](figures/figure2.png) for better resolution and scale.**
+
+### Time of visiting by major states
+
+```{r, echo=FALSE, message=FALSE}
+data |>
+  filter(pt_state %in% c("VA", "MD", "DC")) |>
+  select(new_srvc_date, pt_state) |>
+  mutate(new_srvc_date = make_date(
+    year = year(new_srvc_date),
+    month = month(new_srvc_date)
+  )) |>
+  group_by(new_srvc_date, pt_state) |>
+  summarise(count = n()) |>
+  drop_na(new_srvc_date) |>
+  ggplot(aes(x = new_srvc_date, y = count, color = pt_state)) +
+  geom_line() +
+  scale_y_continuous(limits = c(0, 350)) +
+  scale_colour_manual(
+    values = met.brewer("Hiroshige", 3, "discrete"),
+    aesthetics = c("fill", "color")
+  ) +
+  labs(
+    title = glue("MONTHLY VISITS BY STATES"),
+    subtitle = glue("Missing values excluded."),
+    caption = glue("**Source**: Hospital Billing Dataset<br>
+                   **Plot by**: Rui Qiu"),
+    x = "date",
+    y = "patient visits"
+  )
+
+ggsave(
+  filename = "figures/figure3.png",
+  plot = last_plot(),
+  height = 8, width = 8
+)
+```
+
+## Diagnosis
+
+Due to limited prior medical knowledge, I only managed to combine multiple diagnoses of the same patient together to see if some keywords are predominant in the large picture.
+
+> A better approach would be using some pre-defined medical term dictionary to match the patterns of diagnoses.
+
+The resulted data frame looks like this:
+
+```{r, echo=FALSE, message=FALSE}
+tmp <- data |>
+  select(ID, starts_with("dx") & ends_with("desc")) |>
+  mutate(dx = paste(
+    dx1_desc, dx2_desc, dx3_desc,
+    dx4_desc, dx5_desc, dx6_desc,
+    dx7_desc, dx8_desc, dx9_desc
+  )) |>
+  select(ID, dx) |>
+  mutate(dx = str_replace_all(dx, " NA | NA|NA ", "")) |>
+  distinct()
+
+tmp |>
+  top_n(10) |>
+  knitr::kable()
+```
+
+```{r, echo=FALSE, message=FALSE}
+tmp |>
+  unnest_tokens(word, dx) |>
+  anti_join(stop_words) |>
+  count(word, sort = TRUE) |>
+  top_n(20) |>
+  mutate(word = reorder(word, n)) |>
+  ggplot(aes(n, word)) +
+  geom_col() +
+  scale_colour_manual(
+    values = met.brewer("Hiroshige", 1, "discrete"),
+    aesthetics = c("fill", "color")
+  ) +
+  labs(
+    title = glue("FREQUENT MEDICAL TERMINOLOGIES"),
+    sutitle = glue("IN DIAGNOSES"),
+    caption = glue("**Source**: Hospital Billing Dataset<br>
+                   **Plot by**: Rui Qiu"),
+    x = "word count",
+    y = "terminology"
+  )
+
+ggsave(
+  filename = "figures/figure4.png",
+  plot = last_plot(),
+  height = 8, width = 8
+)
+```
+
+# Dashboard
+
+Another page of Shiny dashboard aims to tackle the following tasks.
+
+It is accessible at [this link](https://rexarski.shinyapps.io/hospital-billing/)
+
+
+```{r, echo=FALSE, message=FALSE}
+# # Extract the scripts used in this file as a separate .R file
+# knitr::purl(
+#   input = "index.Rmd",
+#   output = "script.R",
+#   documentation = 0
+# )
+#
+# style_file("index.Rmd")
+```
